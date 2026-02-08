@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>TSTS v22.15 Final-Full-Sensors (Trigger Select)</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/nosleep/0.12.0/NoSleep.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@900&display=swap');
+        body { margin: 0; background: #000; color: #fff; font-family: 'Roboto Condensed', sans-serif; overflow: hidden; height: 100dvh; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        #car_no_display { font-size: 40vw; line-height: 1; color: #00ffff; }
+        #status_label { font-size: 6vw; color: #ff9500; text-align: center; height: 1.2em; }
+        
+        /* 設定切り替えボタンのスタイル */
+        #config_area { position: fixed; top: 10px; left: 10px; z-index: 100; display: flex; flex-direction: column; gap: 5px; }
+        .config_btn { background: #222; color: #aaa; border: 1px solid #444; padding: 5px 10px; font-size: 3vw; border-radius: 5px; }
+        .config_btn.active { background: #008800; color: #fff; border-color: #0f0; }
+
+        #role_indicator { position: fixed; top: 10px; right: 10px; font-size: 4vw; padding: 5px 10px; border: 1px solid #fff; border-radius: 5px; background: #222; z-index: 100; }
+        #gps_info { position: fixed; bottom: 90px; font-family: monospace; font-size: 3.5vw; color: #0f0; text-align: center; opacity: 0.6; }
+        #btn_area { position: fixed; bottom: 20px; display: flex; gap: 10px; }
+        button { background: #444; color: #fff; border: 1px solid #777; padding: 12px 24px; font-size: 4vw; border-radius: 10px; font-weight: bold; }
+        #btn_test { background: #b00; border-color: #f00; }
+        #btn_log { background: #006666; border-color: #00ffff; }
+        .linked { color: #0f0 !important; border-color: #0f0 !important; }
+        .rec_active { color: #ff0000 !important; animation: blink 1s infinite; }
+        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <div id="config_area">
+        <button id="trigger_10" class="config_btn" onclick="setTrigger(10)">START: 10km/h</button>
+        <button id="trigger_50" class="config_btn active" onclick="setTrigger(50)">START: 50km/h</button>
+    </div>
+
+    <div id="role_indicator" onclick="toggleRole()">MODE: PARENT</div>
+    <div id="car_no_display">--</div>
+    <div id="status_label">WAITING LINK...</div>
+    
+    <div id="gps_info">
+        LAT: <span id="lat">0.000000</span> / LNG: <span id="lng">0.000000</span><br>
+        SPEED: <span id="speed">0.0</span> km/h / LOG: <span id="buf_size">0</span> pts
+    </div>
+
+    <div id="btn_area">
+        <button id="btn_connect">CONNECT</button>
+        <button id="btn_log" onclick="saveLogFile()">LOG SAVE</button>
+        <button id="btn_test">FULL TEST SEND</button>
+    </div>
+
+<script>
+    const GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwKaLuUX5AipDot7WPNIF9fk22tgPS6xgcJiaRtzWI5Va2iXa73kwfr2-HIFoecBJEN/exec"; 
+
+    // --- ロギング設定の初期化 ---
+    let START_SPEED = 50.0; 
+    let STOP_SPEED = 10.0;
+    const STOP_DELAY = 8000;
+    let isLogging = false;
+    let stopTimer = null;
+
+    // トリガー速度の選択
+    function setTrigger(speed) {
+        START_SPEED = speed;
+        if(speed === 10) {
+            STOP_SPEED = 5.0; // 10km/h開始なら、停止判定は5km/hに下げる
+            document.getElementById('trigger_10').classList.add('active');
+            document.getElementById('trigger_50').classList.remove('active');
+        } else {
+            STOP_SPEED = 10.0;
+            document.getElementById('trigger_10').classList.remove('active');
+            document.getElementById('trigger_50').classList.add('active');
+        }
+        console.log("Trigger Speed Set to: " + START_SPEED);
+    }
+
+    let myRole = "PARENT"; 
+    let peer, conn;
+    let noSleep = new NoSleep();
+    let unifiedBuffer = [];
+    let curGps = { lat: 0, lng: 0, speed: 0, timestamp: 0 };
+    let sectorStarts = { S1: 0, S2: 0, S3: 0, LAP: 0 };
+    let lastGpsPoint = null;
+
+    function startSensors() {
+        if (typeof DeviceMotionEvent.requestPermission === 'function') {
+            DeviceMotionEvent.requestPermission().then(response => {
+                if (response == 'granted') {
+                    window.addEventListener('devicemotion', handleMotion, true);
+                }
+            }).catch(console.error);
+        } else {
+            window.addEventListener('devicemotion', handleMotion, true);
+        }
+    }
+
+    function handleMotion(e) {
+        // --- 速度トリガー制御 ---
+        if (!isLogging && curGps.speed >= START_SPEED) {
+            isLogging = true;
+            if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+        } else if (isLogging && curGps.speed <= STOP_SPEED) {
+            if (!stopTimer) {
+                stopTimer = setTimeout(() => {
+                    isLogging = false;
+                    stopTimer = null;
+                }, STOP_DELAY);
+            }
+        } else if (curGps.speed > STOP_SPEED) {
+            if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+        }
+
+        if (isLogging) {
+            const data = {
+                timestamp: Date.now(),
+                lat: curGps.lat,
+                lng: curGps.lng,
+                speed: curGps.speed,
+                accX: e.accelerationIncludingGravity.x || 0,
+                accY: e.accelerationIncludingGravity.y || 0,
+                accZ: e.accelerationIncludingGravity.z || 0,
+                rotA: e.rotationRate.alpha || 0,
+                rotB: e.rotationRate.beta || 0,
+                rotG: e.rotationRate.gamma || 0
+            };
+            unifiedBuffer.push(data);
+            document.getElementById('buf_size').innerText = unifiedBuffer.length;
+            
+            if(!document.getElementById('status_label').innerText.includes("SENT")) {
+                document.getElementById('status_label').innerText = "● REC ACTIVE";
+                document.getElementById('status_label').classList.add('rec_active');
+            }
+        } else {
+            document.getElementById('status_label').classList.remove('rec_active');
+            if (unifiedBuffer.length > 0 && document.getElementById('status_label').innerText.includes("REC")) {
+                document.getElementById('status_label').innerText = "IDLE (WAIT SPEED)";
+            }
+        }
+    }
+
+    function saveLogFile() {
+        if (unifiedBuffer.length === 0) { alert("データがありません"); return; }
+        const formatTS = (ms) => {
+            const d = new Date(ms);
+            return `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}:${d.getSeconds().toString().padStart(2,'0')}.${d.getMilliseconds().toString().padStart(3,'0')}`;
+        };
+        let csv = "time,lat,lng,speed,accX,accY,accZ,gyroA,gyroB,gyroG\n";
+        csv += unifiedBuffer.map(d => `${formatTS(d.timestamp)},${d.lat},${d.lng},${d.speed},${d.accX.toFixed(3)},${d.accY.toFixed(3)},${d.accZ.toFixed(3)},${d.rotA.toFixed(3)},${d.rotB.toFixed(3)},${d.rotG.toFixed(3)}`).join("\n");
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `FSW_FULL_LOG_${Date.now()}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }
+
+    function toggleRole() {
+        myRole = (myRole === "PARENT") ? "CHILD" : "PARENT";
+        document.getElementById('role_indicator').innerText = "MODE: " + myRole;
+        document.getElementById('car_no_display').innerText = (myRole === "PARENT" ? "A" : "B");
+    }
+
+    document.getElementById('btn_connect').onclick = () => {
+        noSleep.enable();
+        startSensors(); 
+        const peerId = (myRole === "PARENT") ? "TSTS_UNIT_A" : "TSTS_UNIT_B";
+        if (peer) peer.destroy();
+        peer = new Peer(peerId);
+        peer.on('open', (id) => {
+            document.getElementById('status_label').innerText = "ID: " + id;
+            if (myRole === "CHILD") { conn = peer.connect("TSTS_UNIT_A"); setupConn(conn); }
+        });
+        peer.on('connection', (c) => setupConn(c));
+    };
+
+    function setupConn(c) {
+        conn = c;
+        conn.on('open', () => {
+            document.getElementById('status_label').innerText = "LINKED";
+            document.getElementById('status_label').classList.add('linked');
+        });
+        conn.on('data', (data) => { if (myRole === "PARENT") processGpsData("CHILD", data); });
+    }
+
+    navigator.geolocation.watchPosition((pos) => {
+        const data = {
+            lat: pos.coords.latitude, lng: pos.coords.longitude,
+            speed: (pos.coords.speed || 0) * 3.6, timestamp: Date.now()
+        };
+        curGps = data; 
+        updateUI(data);
+        if (myRole === "CHILD") { if (conn && conn.open) conn.send(data); } 
+        else { processGpsData("PARENT", data); }
+    }, null, { enableHighAccuracy: true });
+
+    function processGpsData(source, data) {
+        if (myRole === "PARENT") {
+            if (lastGpsPoint) checkGateCross(lastGpsPoint, data);
+            lastGpsPoint = data;
+            runDynamicVMin();
+        }
+    }
+
+    function checkGateCross(p1, p2) {
+        const GATES = [
+            { name: "S1", p1: {lat: 35.372158, lng: 138.931048}, p2: {lat: 35.3723, lng: 138.9313} },
+            { name: "S2", p1: {lat: 35.36528, lng: 138.923587}, p2: {lat: 35.3654, lng: 138.9238} },
+            { name: "LAP", p1: {lat: 35.376253, lng: 138.933661}, p2: {lat: 35.3765, lng: 138.9339} }
+        ];
+        GATES.forEach(gate => {
+            const crossTime = getIntersectTime(p1, p2, gate);
+            if (crossTime) handleGateEvent(gate.name, crossTime);
+        });
+    }
+
+    function getIntersectTime(p1, p2, gate) {
+        const det = (p2.lat - p1.lat) * (gate.p2.lng - gate.p1.lng) - (p2.lng - p1.lng) * (gate.p2.lat - gate.p1.lat);
+        if (det === 0) return null;
+        const u = ((gate.p1.lat - p1.lat) * (gate.p2.lng - gate.p1.lng) - (gate.p1.lng - p1.lng) * (gate.p2.lat - gate.p1.lat)) / det;
+        const v = ((gate.p1.lat - p1.lat) * (p2.lng - p1.lng) - (gate.p1.lng - p1.lng) * (p2.lat - p1.lat)) / det;
+        return (u >= 0 && u <= 1 && v >= 0 && v <= 1) ? p1.timestamp + (p2.timestamp - p1.timestamp) * u : null;
+    }
+
+    function handleGateEvent(name, time) {
+        if (time - (sectorStarts[name] || 0) < 5000) return;
+        let result = { status: name };
+        const duration = (time - sectorStarts[name]) / 1000;
+        if (name === "LAP") {
+            if (sectorStarts.LAP !== 0) { result.lap_time = formatTime(duration); }
+            sectorStarts.S1 = sectorStarts.S2 = sectorStarts.LAP = time;
+        } else {
+            result.sector_val = formatTime(duration); sectorStarts[name] = time;
+        }
+        sendDataToSheet(result);
+    }
+
+    function runDynamicVMin() {
+        if (unifiedBuffer.length < 50) return; 
+        const win = unifiedBuffer.slice(-20);
+        const speeds = win.map(d => d.speed);
+        if (speeds[0] > speeds[10] + 0.5 && speeds[10] < speeds[19] - 0.5) {
+            const vMin = win[10];
+            const corner = findNearestCorner(vMin.lat, vMin.lng);
+            if (corner !== "Straight") {
+                sendDataToSheet({
+                    status: corner, v_min: vMin.speed.toFixed(2),
+                    p1: (win[0].speed - vMin.speed).toFixed(2), p2: (win[19].speed - vMin.speed).toFixed(2)
+                });
+                document.getElementById('status_label').innerText = corner + " V-MIN: " + vMin.speed.toFixed(1);
+            }
+        }
+    }
+
+    function formatTime(sec) {
+        const m = Math.floor(sec / 60);
+        const s = (sec % 60).toFixed(2).padStart(5, '0');
+        return `${m}:${s}`;
+    }
+
+    function findNearestCorner(lat, lng) {
+        const corners = [
+            { name: "T1", lat: 35.376253, lng: 138.933661 }, { name: "T3", lat: 35.372158, lng: 138.931048 },
+            { name: "T4.5", lat: 35.369907, lng: 138.931668 }, { name: "T5", lat: 35.369097, lng: 138.929999 },
+            { name: "T6", lat: 35.370494, lng: 138.928174 }, { name: "T10", lat: 35.364762, lng: 138.923947 },
+            { name: "T11", lat: 35.365280, lng: 138.923587 }, { name: "T13", lat: 35.366259, lng: 138.921743 },
+            { name: "T15", lat: 35.367998, lng: 138.922456 }, { name: "T15.5", lat: 35.366987, lng: 138.920686 },
+            { name: "T16", lat: 35.367411, lng: 138.920085 }
+        ];
+        let nearest = "Straight"; let minD = 0.0004;
+        corners.forEach(cp => {
+            const d = Math.sqrt(Math.pow(lat - cp.lat, 2) + Math.pow(lng - cp.lng, 2));
+            if (d < minD) { minD = d; nearest = cp.name; }
+        });
+        return nearest;
+    }
+
+    async function sendDataToSheet(data) {
+        const params = new URLSearchParams();
+        Object.keys(data).forEach(key => params.append(key, data[key]));
+        params.append("car_no", "9");
+        try {
+            await fetch(GOOGLE_SHEET_URL, {
+                method: "POST", mode: "no-cors",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: params.toString()
+            });
+            document.getElementById('status_label').innerText = "SENT: " + (data.status || "DATA");
+        } catch(e) { document.getElementById('status_label').innerText = "SEND ERROR"; }
+    }
+
+    function updateUI(data) {
+        document.getElementById('lat').innerText = data.lat.toFixed(6);
+        document.getElementById('lng').innerText = data.lng.toFixed(6);
+        document.getElementById('speed').innerText = data.speed.toFixed(1);
+    }
+
+    document.getElementById('btn_test').onclick = async () => {
+        const rT = () => (20 + Math.random() * 10).toFixed(2);
+        const rS = () => (50 + Math.random() * 80).toFixed(1);
+        const rD = () => (10 + Math.random() * 40).toFixed(1);
+        document.getElementById('status_label').innerText = "TESTING ALL...";
+        await sendDataToSheet({ status: "LAP", lap_time: "1:5"+Math.floor(Math.random()*9)+"."+Math.floor(Math.random()*99) });
+        await sendDataToSheet({ status: "S1", sector_val: rT() });
+        await sendDataToSheet({ status: "S2", sector_val: rT() });
+        await sendDataToSheet({ status: "S3", sector_val: rT() });
+        const corners = ["T1", "T3", "T4.5", "T5", "T6", "T10", "T11", "T13", "T15", "T15.5", "T16"];
+        for (let c of corners) {
+            await new Promise(r => setTimeout(async () => {
+                await sendDataToSheet({ status: c, v_min: rS(), p1: rD(), p2: rD() });
+                r();
+            }, 150));
+        }
+        document.getElementById('status_label').innerText = "FULL SCAN OK";
+    };
+</script>
+</body>
+</html>
